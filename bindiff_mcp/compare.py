@@ -7,19 +7,27 @@ which runs the exports, the differ and the result files on a worker thread.
 from __future__ import annotations
 
 import json
+import math
+import os
+import sqlite3
+import subprocess
+import tempfile
 import threading
 from collections.abc import Callable
+from contextlib import closing
 from pathlib import Path
 from typing import Any
 
+import bindiff.bindiff as bindiff_module
 from bindiff import BinDiff
 from bindiff.types import BindiffNotFound
 from binexport import ProgramBinExport
 
-from bindiff_mcp.errors import DiffError, ExportError
+from bindiff_mcp.errors import DiffError, ExportError, TimeLimitError
 from bindiff_mcp.export import ExportResult, export_binary, resolve_binary
 from bindiff_mcp.files import sha256_file
 from bindiff_mcp.jobs import JobContext, JobRequest
+from bindiff_mcp.limits import Deadline
 from bindiff_mcp.results import program_metadata, write_results
 
 #: The two binaries are exported into separate directories so that diffing two
@@ -32,6 +40,9 @@ _BINDIFF_MISSING = (
     "reachable through PATH or the BINDIFF_PATH environment variable"
 )
 
+#: Longest differ output kept in an error message.
+_OUTPUT_EXCERPT_CHARS = 2000
+
 
 def export_request(binary: str, output_results_dir: str) -> JobRequest:
     """Validate a ``binexport`` call and describe the job that answers it."""
@@ -41,7 +52,10 @@ def export_request(binary: str, output_results_dir: str) -> JobRequest:
     def work(context: JobContext) -> dict[str, Any]:
         context.stage("exporting")
         result = export_binary(
-            binary_path, directory, progress=context.export_progress("binary")
+            binary_path,
+            directory,
+            deadline=context.deadline,
+            progress=context.export_progress("binary"),
         )
         context.stage("reading the export")
         program = _open_program(result.binexport)
@@ -65,7 +79,7 @@ def compare_request(
     secondary_path = resolve_binary(secondary_binary)
     directory = _output_directory(output_results_dir)
     # Fail before spending minutes on autoanalysis if the differ is missing.
-    _assert_bindiff_installed()
+    differ = _differ_path()
 
     def work(context: JobContext) -> dict[str, Any]:
         context.stage("exporting")
@@ -73,16 +87,20 @@ def compare_request(
             lambda: export_binary(
                 primary_path,
                 directory / PRIMARY_DIR,
+                deadline=context.deadline,
                 progress=context.export_progress("primary"),
             ),
             lambda: export_binary(
                 secondary_path,
                 directory / SECONDARY_DIR,
+                deadline=context.deadline,
                 progress=context.export_progress("secondary"),
             ),
         )
         context.stage("diffing")
-        return _diff(primary, secondary, directory)
+        diff_file = _run_differ(differ, primary, secondary, directory, context.deadline)
+        context.stage("writing results")
+        return _diff_results(primary, secondary, diff_file, directory)
 
     return JobRequest(
         tool="bindiff_compare",
@@ -118,11 +136,13 @@ def _request_key(tool: str, directory: Path, *binaries: Path) -> str:
     return json.dumps([tool, str(directory), *digests])
 
 
-def _assert_bindiff_installed() -> None:
+def _differ_path() -> str:
     try:
         BinDiff.assert_installation_ok()
     except BindiffNotFound as error:
         raise DiffError(_BINDIFF_MISSING) from error
+    # assert_installation_ok() records the executable it found here.
+    return str(bindiff_module.BINDIFF_BINARY)
 
 
 def _in_parallel(
@@ -168,24 +188,77 @@ def _export_fields(result: ExportResult) -> dict[str, Any]:
     }
 
 
-def _diff(
-    primary: ExportResult, secondary: ExportResult, directory: Path
-) -> dict[str, Any]:
+def _run_differ(
+    differ: str,
+    primary: ExportResult,
+    secondary: ExportResult,
+    directory: Path,
+    deadline: Deadline,
+) -> Path:
+    """Diff the two exports into ``<directory>/<primary>_vs_<secondary>.BinDiff``."""
     diff_file = directory / f"{primary.binary.name}_vs_{secondary.binary.name}.BinDiff"
+    remaining = deadline.remaining("diffing")
+    # The differ writes into a scratch directory beside the result, so the
+    # finished database is renamed into place and never seen half-written.
+    with tempfile.TemporaryDirectory(prefix=".bindiff-", dir=directory) as scratch:
+        try:
+            completed = subprocess.run(
+                [
+                    differ,
+                    f"--primary={primary.binexport}",
+                    f"--secondary={secondary.binexport}",
+                    f"--output_dir={scratch}",
+                ],
+                capture_output=True,
+                text=True,
+                errors="replace",
+                timeout=remaining if math.isfinite(remaining) else None,
+                check=False,
+            )
+        except subprocess.TimeoutExpired as error:
+            raise TimeLimitError(
+                f"bindiff did not finish within {error.timeout:.1f} s"
+            ) from error
+        except OSError as error:
+            raise DiffError(f"cannot run {differ}: {error}") from error
+        produced = sorted(Path(scratch).glob("*.BinDiff"))
+        if completed.returncode != 0 or not produced:
+            raise DiffError(
+                f"bindiff could not diff {primary.binexport.name} against "
+                f"{secondary.binexport.name} (exit status {completed.returncode})"
+                f"{_output_excerpt(completed)}"
+            )
+        _link_exports(produced[0], directory, primary.binexport, secondary.binexport)
+        os.replace(produced[0], diff_file)
+    return diff_file
+
+
+def _output_excerpt(completed: subprocess.CompletedProcess[str]) -> str:
+    output = (completed.stderr or completed.stdout or "").strip()
+    return f"\n{output[-_OUTPUT_EXCERPT_CHARS:]}" if output else ""
+
+
+def _link_exports(database: Path, base: Path, primary: Path, secondary: Path) -> None:
+    """Record the exports relative to ``base``, where the BinDiff UI looks for them."""
     try:
-        diff = BinDiff.from_binexport_files(
-            str(primary.binexport),
-            str(secondary.binexport),
-            diff_file,
-            override=True,
-        )
-    except Exception as error:  # the differ and sqlite raise broadly
-        raise DiffError(f"bindiff failed: {error}") from error
-    if diff is None:
-        raise DiffError(
-            f"bindiff could not diff {primary.binexport.name} against "
-            f"{secondary.binexport.name}; see the bindiff output for details"
-        )
+        with closing(sqlite3.connect(database)) as connection:
+            for file_id, export in ((1, primary), (2, secondary)):
+                connection.execute(
+                    "UPDATE file SET filename = ? WHERE id = ?",
+                    (os.path.relpath(export.with_suffix(""), base), file_id),
+                )
+            connection.commit()
+    except sqlite3.Error as error:
+        raise DiffError(f"cannot update {database.name}: {error}") from error
+
+
+def _diff_results(
+    primary: ExportResult, secondary: ExportResult, diff_file: Path, directory: Path
+) -> dict[str, Any]:
+    try:
+        diff = BinDiff(str(primary.binexport), str(secondary.binexport), str(diff_file))
+    except Exception as error:  # protobuf and sqlite raise broadly
+        raise DiffError(f"cannot read {diff_file.name}: {error}") from error
 
     results = write_results(diff, directory)
     return {

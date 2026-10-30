@@ -1,8 +1,9 @@
-"""Jobs: one per identical request, bounded waits and restart records."""
+"""Jobs: one per identical request, bounded waits, limits and restart records."""
 
 from __future__ import annotations
 
 import threading
+import time
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -12,6 +13,7 @@ import pytest
 from bindiff_mcp.errors import ExportError, UnknownJobError
 from bindiff_mcp.jobs import (
     FAILED,
+    QUEUED,
     RUNNING,
     SUCCEEDED,
     JobContext,
@@ -92,6 +94,35 @@ def test_a_failed_job_reports_its_error_and_a_retry_starts_over(
     assert record["error"] == "IDA could not open sample.bin"
     assert retry.job_id != failed.job_id
     assert jobs.wait(retry.job_id, 5)["status"] == SUCCEEDED
+
+
+def test_jobs_beyond_the_limit_wait_in_the_queue(tmp_path: Path) -> None:
+    jobs = JobManager(tmp_path, max_jobs=1)
+    first_gate, second_gate = Gate(), Gate()
+    jobs.submit(_request(first_gate, key="first"))
+    assert first_gate.started.wait(5)
+
+    second = jobs.submit(_request(second_gate, key="second"))
+    queued = jobs.wait(second.job_id, 0.1)
+    first_gate.open.set()
+    second_gate.open.set()
+
+    assert queued["status"] == QUEUED
+    assert jobs.wait(second.job_id, 5)["status"] == SUCCEEDED
+
+
+def test_a_job_past_its_time_limit_fails_naming_the_stage(tmp_path: Path) -> None:
+    jobs = JobManager(tmp_path, job_timeout=0.05)
+
+    def slow(context: JobContext) -> dict[str, Any]:
+        time.sleep(0.1)
+        context.deadline.remaining("diffing")
+        return {}
+
+    record = jobs.wait(jobs.submit(_request(slow)).job_id, 5)
+
+    assert record["status"] == FAILED
+    assert record["error"] == "the job reached its 0.05 s limit before diffing"
 
 
 def test_finished_jobs_outlive_a_restart_and_unfinished_ones_say_so(

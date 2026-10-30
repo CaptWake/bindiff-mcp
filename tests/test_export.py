@@ -1,25 +1,32 @@
-"""Export reuse and locking, IDA worker snippet, and BinExport failure reporting."""
+"""Export reuse and locking, IDA worker snippet, time limits, failure reporting."""
 
 from __future__ import annotations
 
 import ast
 import json
 import os
+import signal
+import subprocess
 import sys
 import threading
+import time
 import types
+from contextlib import suppress
 from pathlib import Path
 
 import pytest
+from ida_nexus.errors import RemoteError
 
-from bindiff_mcp.errors import ExportError
+from bindiff_mcp.errors import ExportError, TimeLimitError
 from bindiff_mcp.export import (
     _EXPORT_TEMPLATE,
     PLUGIN_NAMES,
     ExportResult,
     _check_export,
+    _stop_worker,
     export_binary,
 )
+from bindiff_mcp.limits import Deadline
 
 
 def _execution(result: object, stdout: str = "", stderr: str = "") -> dict:
@@ -271,3 +278,101 @@ def test_concurrent_exports_of_one_binary_run_ida_once(
 
     assert len(exports) == 1
     assert sorted(result.reused for result in results) == [False, True]
+
+
+class _EndlessAnalysis:
+    """Stands in for the Nexus manager of a binary IDA never finishes analyzing."""
+
+    def __init__(self) -> None:
+        self.closed: list[str] = []
+        self.executed = False
+
+    def open_database(self, path: str, *, set_current: bool) -> dict:
+        return {"instance_id": "worker"}
+
+    def wait_autoanalysis(self, instance_id: str, timeout: float) -> dict:
+        time.sleep(timeout)
+        raise RemoteError("operation_timeout", "analysis timed out", 408)
+
+    def execute_python(self, *_: object, **__: object) -> dict:
+        self.executed = True
+        return {}
+
+    def close_database(self, instance_id: str) -> None:
+        self.closed.append(instance_id)
+
+
+def test_autoanalysis_stops_at_the_job_limit_and_releases_ida(
+    tmp_path: Path, monkeypatch
+) -> None:
+    binary = tmp_path / "sample.bin"
+    binary.write_bytes(b"\x7fELF")
+    nexus = _EndlessAnalysis()
+    monkeypatch.setattr("bindiff_mcp.export.DATABASE_MANAGER", nexus)
+
+    with pytest.raises(TimeLimitError, match="autoanalysis of sample.bin"):
+        export_binary(binary, tmp_path / "out", deadline=Deadline.after(0.2))
+
+    assert nexus.closed == ["worker"]
+    assert not nexus.executed
+    assert list((tmp_path / "out").iterdir()) == []
+
+
+_SLEEPS = "import time\nprint(flush=True)\ntime.sleep(60)\n"
+_SPAWNS_GRANDCHILD = (
+    "import subprocess, sys\n"
+    "child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'])\n"
+    "print(child.pid, flush=True)\n"
+    "child.wait()\n"
+)
+
+
+@pytest.mark.skipif(not Path("/proc/self/stat").exists(), reason="reads /proc")
+def test_a_worker_left_running_is_killed_and_its_leftovers_dropped(
+    tmp_path: Path, monkeypatch
+) -> None:
+    monkeypatch.setattr("bindiff_mcp.export._WORKER_EXIT_SECONDS", 0.5)
+    binary = tmp_path / "sample.bin"
+    binary.write_bytes(b"\x7fELF")
+    (tmp_path / "sample.bin.i64").write_bytes(b"the database last packed")
+    # What a killed worker leaves: an unlocked .id0 whose B-tree is still open.
+    (tmp_path / "sample.bin.id0").write_bytes(
+        bytes(18) + b"\x01" + b"B-tree v2" + bytes(64)
+    )
+    (tmp_path / "sample.bin.nam").write_bytes(b"names")
+    stuck = subprocess.Popen([sys.executable, "-c", _SLEEPS], stdout=subprocess.PIPE)
+    try:
+        assert stuck.stdout is not None
+        stuck.stdout.readline()
+
+        _stop_worker(stuck.pid, binary)
+
+        assert stuck.wait(5) == -signal.SIGKILL
+    finally:
+        stuck.kill()
+        stuck.wait(5)
+    assert sorted(path.name for path in tmp_path.iterdir()) == [
+        "sample.bin",
+        "sample.bin.i64",
+    ]
+
+
+@pytest.mark.skipif(not Path("/proc/self/stat").exists(), reason="reads /proc")
+def test_a_process_this_server_did_not_spawn_is_never_stopped(
+    tmp_path: Path, monkeypatch
+) -> None:
+    monkeypatch.setattr("bindiff_mcp.export._WORKER_EXIT_SECONDS", 0.5)
+    parent = subprocess.Popen(
+        [sys.executable, "-c", _SPAWNS_GRANDCHILD], stdout=subprocess.PIPE
+    )
+    assert parent.stdout is not None
+    foreign = int(parent.stdout.readline())
+    try:
+        _stop_worker(foreign, tmp_path / "sample.bin")
+
+        os.kill(foreign, 0)  # still running
+    finally:
+        with suppress(ProcessLookupError):
+            os.kill(foreign, signal.SIGKILL)
+        parent.kill()
+        parent.wait(5)

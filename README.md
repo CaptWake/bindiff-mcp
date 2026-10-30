@@ -62,7 +62,11 @@ Poll `bindiff_job` until `status` is `succeeded`; the tool's output is then in
 `result`. A failed job comes back as a tool error that names its stage.
 Repeating a request for the same binaries (by SHA-256) and output directory
 joins the job still running instead of exporting them again; one binary is
-never exported by two jobs at once.
+never exported by two jobs at once. At most `BINDIFF_MCP_MAX_JOBS` jobs run at
+a time, and `BINDIFF_MCP_JOB_TIMEOUT` bounds every stage of a job. IDA cannot
+interrupt an analysis, so an idalib worker still busy when its stage runs out
+of time is killed and its unsaved database files are dropped; the next export
+starts again from the binary or from the last saved `.i64`.
 
 ### `binexport(binary, output_results_dir=".", wait_seconds=20)`
 
@@ -110,10 +114,13 @@ failed and has to be submitted again.
 
 ## Environment
 
-| Variable                     | Default                      | Meaning                                        |
-| ---------------------------- | ---------------------------- | ---------------------------------------------- |
-| `BINDIFF_MCP_OPEN_TIMEOUT`   | `600`                        | Seconds to wait for IDA to open a database     |
-| `BINDIFF_MCP_EXPORT_TIMEOUT` | `1800`                       | Seconds for one export, excluding autoanalysis |
-| `BINDIFF_MCP_STATE_DIR`      | `~/.local/state/bindiff-mcp` | Job records; keep it on a persistent volume    |
-| `BINDIFF_PATH`               | —                            | Directory containing the `bindiff` differ      |
+| Variable                       | Default                      | Meaning                                                 |
+| ------------------------------ | ---------------------------- | ------------------------------------------------------- |
+| `BINDIFF_MCP_OPEN_TIMEOUT`     | `600`                        | Seconds to wait for IDA to open a database              |
+| `BINDIFF_MCP_ANALYSIS_TIMEOUT` | `7200`                       | Seconds for the initial autoanalysis of one binary      |
+| `BINDIFF_MCP_EXPORT_TIMEOUT`   | `1800`                       | Seconds for the BinExport step after autoanalysis       |
+| `BINDIFF_MCP_JOB_TIMEOUT`      | `14400`                      | Seconds for a whole job once it starts; caps each stage |
+| `BINDIFF_MCP_MAX_JOBS`         | `2`                          | Jobs run at once; each uses up to two idalib workers    |
+| `BINDIFF_MCP_STATE_DIR`        | `~/.local/state/bindiff-mcp` | Job records; keep it on a persistent volume             |
+| `BINDIFF_PATH`                 | —                            | Directory containing the `bindiff` differ               |
 

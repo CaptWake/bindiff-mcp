@@ -12,7 +12,9 @@ from __future__ import annotations
 import json
 import math
 import os
+import signal
 import threading
+import time
 from collections.abc import Callable, Generator
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass
@@ -20,10 +22,22 @@ from pathlib import Path
 from string import Template
 from typing import Any
 
-from ida_nexus import DatabaseManager, NexusError, PythonExecutionResult
+from ida_nexus import (
+    DatabaseManager,
+    NexusError,
+    PythonExecutionResult,
+    probe_database_state,
+)
 
-from bindiff_mcp.errors import ExportError
+from bindiff_mcp.errors import ExportError, TimeLimitError
 from bindiff_mcp.files import staging_path
+from bindiff_mcp.limits import (
+    ANALYSIS_TIMEOUT_SECONDS,
+    EXPORT_TIMEOUT_SECONDS,
+    OPEN_TIMEOUT_SECONDS,
+    UNLIMITED,
+    Deadline,
+)
 
 #: Extension of the files produced by the BinExport IDA plugin.
 BINEXPORT_SUFFIX = ".BinExport"
@@ -37,29 +51,28 @@ OPERATION_LABEL = "bindiff-mcp"
 #: Longest IDC/IDAPython output kept in an error message.
 _LOG_EXCERPT_CHARS = 2000
 
+#: How long a worker gets to exit after each step of ``_stop_worker``.
+_WORKER_EXIT_SECONDS = 10.0
 
-def _timeout_from_environment(name: str, default: float) -> float:
-    raw_value = os.environ.get(name)
-    if raw_value is None or not raw_value.strip():
-        return default
-    try:
-        timeout = float(raw_value)
-    except ValueError as error:
-        raise ValueError(f"{name} must be a number") from error
-    if not math.isfinite(timeout) or timeout <= 0:
-        raise ValueError(f"{name} must be positive and finite")
-    return timeout
+#: The idalib worker process behind each open database, by instance id.
+_WORKER_PIDS: dict[str, int] = {}
 
 
-#: Attaching to a GUI instance is immediate; spawning an idalib worker is not.
-OPEN_TIMEOUT_SECONDS = _timeout_from_environment("BINDIFF_MCP_OPEN_TIMEOUT", 600.0)
+def _record_worker(event: str, fields: dict[str, Any]) -> None:
+    target = fields.get("target")
+    if (
+        event == "database_opened"
+        and isinstance(target, dict)
+        and target.get("backend") == "idalib"
+        and isinstance(target.get("pid"), int)
+    ):
+        _WORKER_PIDS[str(fields["instance_id"])] = target["pid"]
 
-#: Autoanalysis is awaited separately, so this only covers the export itself.
-EXPORT_TIMEOUT_SECONDS = _timeout_from_environment("BINDIFF_MCP_EXPORT_TIMEOUT", 1800.0)
 
 DATABASE_MANAGER = DatabaseManager(
     open_timeout=OPEN_TIMEOUT_SECONDS,
     execute_timeout=EXPORT_TIMEOUT_SECONDS,
+    on_event=_record_worker,
 )
 
 #: One lock per binary and per BinExport path; see ``export_binary``.
@@ -133,6 +146,7 @@ def export_binary(
     output_dir: str | Path,
     *,
     override: bool = False,
+    deadline: Deadline = UNLIMITED,
     progress: Callable[[str], None] = _ignore_progress,
 ) -> ExportResult:
     """Export ``binary`` to ``<output_dir>/<binary name>.BinExport``.
@@ -154,7 +168,7 @@ def export_binary(
         ) from error
     target = directory.resolve() / (binary_path.name + BINEXPORT_SUFFIX)
 
-    with _exclusively(binary_path, target, progress):
+    with _exclusively(binary_path, target, deadline, progress):
         if not override and _is_current(target, binary_path):
             progress("reused")
             return ExportResult(binary=binary_path, binexport=target, reused=True)
@@ -163,7 +177,7 @@ def export_binary(
         with suppress(OSError):
             target.unlink(missing_ok=True)
 
-        _run_export(binary_path, target, progress=progress)
+        _run_export(binary_path, target, deadline=deadline, progress=progress)
     progress("done")
     return ExportResult(binary=binary_path, binexport=target, reused=False)
 
@@ -189,7 +203,7 @@ def _is_current(target: Path, binary: Path) -> bool:
 
 @contextmanager
 def _exclusively(
-    binary: Path, target: Path, progress: Callable[[str], None]
+    binary: Path, target: Path, deadline: Deadline, progress: Callable[[str], None]
 ) -> Generator[None, None, None]:
     """Hold the locks of ``binary`` and ``target``, always taken in path order."""
     held: list[threading.Lock] = []
@@ -198,8 +212,14 @@ def _exclusively(
             with _PATH_LOCKS_GUARD:
                 lock = _PATH_LOCKS.setdefault(path, threading.Lock())
             if not lock.acquire(blocking=False):
-                progress(f"waiting for another export of {binary.name}")
-                lock.acquire()
+                stage = f"waiting for another export of {binary.name}"
+                progress(stage)
+                timeout = deadline.remaining(stage)
+                if not lock.acquire(timeout=timeout if math.isfinite(timeout) else -1):
+                    raise TimeLimitError(
+                        f"the job reached its {deadline.seconds:g} s limit while "
+                        f"another job was still exporting {binary.name}"
+                    )
             held.append(lock)
         yield
     finally:
@@ -207,10 +227,25 @@ def _exclusively(
             lock.release()
 
 
+@contextmanager
+def _time_limit(stage: str, timeout: float) -> Generator[None, None, None]:
+    """Report a Nexus failure at ``timeout`` as ``stage`` running out of time."""
+    started = time.monotonic()
+    try:
+        yield
+    except NexusError as error:
+        if time.monotonic() - started >= timeout:
+            raise TimeLimitError(
+                f"{stage} did not finish within {timeout:.1f} s"
+            ) from error
+        raise
+
+
 def _run_export(
     binary: Path,
     target: Path,
     *,
+    deadline: Deadline = UNLIMITED,
     progress: Callable[[str], None] = _ignore_progress,
 ) -> None:
     # IDA writes a staging file that is renamed into place, so an export that
@@ -221,30 +256,47 @@ def _run_export(
         plugins=json.dumps(list(PLUGIN_NAMES)),
     )
     progress("opening")
+    deadline.remaining(f"opening {binary.name}")
     try:
         opened = DATABASE_MANAGER.open_database(str(binary), set_current=False)
     except (NexusError, OSError, ValueError) as error:
         raise ExportError(f"IDA could not open {binary.name}: {error}") from error
 
     instance_id = opened["instance_id"]
+    timed_out = False
     try:
         progress("autoanalysis")
-        DATABASE_MANAGER.ensure_autoanalysis(instance_id)
+        stage = f"autoanalysis of {binary.name}"
+        timeout = deadline.limit(stage, ANALYSIS_TIMEOUT_SECONDS)
+        with _time_limit(stage, timeout):
+            analysis = DATABASE_MANAGER.wait_autoanalysis(instance_id, timeout)
+        if not analysis["complete"]:
+            raise ExportError(f"{stage} stopped early ({analysis['status']})")
+
         progress("exporting")
-        execution = DATABASE_MANAGER.execute_python(
-            code,
-            instance_id,
-            timeout=EXPORT_TIMEOUT_SECONDS,
-            operation_label=OPERATION_LABEL,
-            filename="<bindiff-mcp:binexport>",
-        )
+        stage = f"BinExport of {binary.name}"
+        timeout = deadline.limit(stage, EXPORT_TIMEOUT_SECONDS)
+        with _time_limit(stage, timeout):
+            execution = DATABASE_MANAGER.execute_python(
+                code,
+                instance_id,
+                timeout=timeout,
+                operation_label=OPERATION_LABEL,
+                filename="<bindiff-mcp:binexport>",
+            )
     except (NexusError, ValueError) as error:
         raise ExportError(f"BinExport failed for {binary.name}: {error}") from error
+    except TimeLimitError:
+        timed_out = True
+        raise
     finally:
         # The lease is per-export: releasing it lets the idalib worker exit
         # instead of holding the database for the rest of the session.
         with suppress(Exception):
             DATABASE_MANAGER.close_database(instance_id)
+        worker = _WORKER_PIDS.pop(instance_id, None)
+        if timed_out and worker is not None:
+            _stop_worker(worker, binary)
 
     try:
         _check_export(binary, staging, execution)
@@ -252,6 +304,52 @@ def _run_export(
     finally:
         with suppress(OSError):
             staging.unlink(missing_ok=True)
+
+
+def _stop_worker(pid: int, binary: Path) -> None:
+    """Make sure the worker of a stage that ran out of time is gone.
+
+    IDA cannot interrupt autoanalysis or an export underway, and a worker whose
+    lease is released in the middle of one never shuts down. It is killed rather
+    than asked to save: packing can outlast any grace period, and a kill leaves
+    the packed database untouched. Only children of this process are stopped,
+    never a GUI instance or another client's worker.
+    """
+    if _exited(pid):
+        return
+    with suppress(ProcessLookupError):
+        os.kill(pid, signal.SIGKILL)
+    if not _exited(pid):
+        return
+    # Nexus would repair the half-analyzed leftovers into a database whose
+    # functions differ from a full analysis. Without them the next open starts
+    # over from the binary, or from the database last packed.
+    state = probe_database_state(binary)
+    if state["state"] == "crashed":
+        for component in state["unpacked_files"]:
+            with suppress(OSError):
+                Path(component).unlink()
+
+
+def _exited(pid: int) -> bool:
+    """Wait up to ``_WORKER_EXIT_SECONDS`` for child ``pid`` to be gone."""
+    deadline = time.monotonic() + _WORKER_EXIT_SECONDS
+    while _child_state(pid) not in (None, "Z"):
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.2)
+    return True
+
+
+def _child_state(pid: int) -> str | None:
+    """Process state of ``pid`` if it is a child of this process, else ``None``."""
+    try:
+        stat = Path(f"/proc/{pid}/stat").read_text(encoding="ascii", errors="replace")
+    except OSError:
+        return None
+    # The command name in parentheses may contain spaces; state and ppid follow.
+    state, parent = stat[stat.rindex(")") + 2 :].split()[:2]
+    return state if int(parent) == os.getpid() else None
 
 
 def _check_export(binary: Path, target: Path, execution: PythonExecutionResult) -> None:

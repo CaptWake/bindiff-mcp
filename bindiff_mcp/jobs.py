@@ -13,6 +13,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import queue
 import re
 import sys
 import threading
@@ -26,6 +27,7 @@ from typing import Any
 
 from bindiff_mcp.errors import BindiffMcpError, UnknownJobError
 from bindiff_mcp.files import write_text_atomic
+from bindiff_mcp.limits import JOB_TIMEOUT_SECONDS, MAX_JOBS, Deadline
 
 #: Shorter than the 30 s request timeout common among MCP clients.
 DEFAULT_WAIT_SECONDS = 20.0
@@ -104,9 +106,12 @@ class Job:
 
 
 class JobContext:
-    """What a running job gets: a way to report its progress."""
+    """What a running job gets: its deadline and a way to report progress."""
 
-    def __init__(self, job: Job, publish: Callable[[Job], None]) -> None:
+    def __init__(
+        self, job: Job, deadline: Deadline, publish: Callable[[Job], None]
+    ) -> None:
+        self.deadline = deadline
         self._job = job
         self._publish = publish
 
@@ -135,18 +140,28 @@ class JobRequest:
 
 
 class JobManager:
-    """Runs every job on its own thread and keeps the job records."""
+    """Runs jobs on at most ``max_jobs`` worker threads and keeps their records."""
 
-    def __init__(self, state_dir: Path) -> None:
+    def __init__(
+        self,
+        state_dir: Path,
+        *,
+        max_jobs: int = MAX_JOBS,
+        job_timeout: float = JOB_TIMEOUT_SECONDS,
+    ) -> None:
         self._records = state_dir / "jobs"
+        self._max_jobs = max_jobs
+        self._job_timeout = job_timeout
         self._lock = threading.Lock()
         self._save_lock = threading.Lock()
         self._jobs: dict[str, Job] = {}
         self._active: dict[str, Job] = {}
+        self._queue: queue.SimpleQueue[tuple[Job, JobRequest]] = queue.SimpleQueue()
+        self._workers = 0
         self._save_failed = False
 
     def submit(self, request: JobRequest) -> Job:
-        """Start ``request``, or return the unfinished job of an identical one."""
+        """Queue ``request``, or return the unfinished job of an identical one."""
         with self._lock:
             active = self._active.get(request.key)
             if active is not None:
@@ -160,15 +175,17 @@ class JobManager:
             )
             self._jobs[job.job_id] = job
             self._active[request.key] = job
+            if self._workers < self._max_jobs:
+                self._workers += 1
+                # Daemon threads: a job in progress must not hold the process
+                # open once the server is told to stop.
+                threading.Thread(
+                    target=self._work,
+                    name=f"bindiff-mcp-job-{self._workers}",
+                    daemon=True,
+                ).start()
         self._save(job)
-        # A daemon thread: a job in progress must not hold the process open
-        # once the server is told to stop.
-        threading.Thread(
-            target=self._run,
-            args=(job, request),
-            name=f"bindiff-mcp-job-{job.job_id}",
-            daemon=True,
-        ).start()
+        self._queue.put((job, request))
         return job
 
     def wait(self, job_id: str, seconds: float) -> dict[str, Any]:
@@ -180,10 +197,15 @@ class JobManager:
         job.done.wait(_bounded_wait(seconds))
         return job.snapshot()
 
+    def _work(self) -> None:
+        while True:
+            job, request = self._queue.get()
+            self._run(job, request)
+
     def _run(self, job: Job, request: JobRequest) -> None:
         job.update(status=RUNNING, stage="starting", started_at=time.time())
         self._save(job)
-        context = JobContext(job, self._save)
+        context = JobContext(job, Deadline.after(self._job_timeout), self._save)
         outcome: dict[str, Any]
         try:
             outcome = {
