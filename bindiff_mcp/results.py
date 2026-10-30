@@ -11,6 +11,8 @@ from bindiff.file import FunctionMatch
 from bindiff.types import function_algorithm_str
 from binexport import FunctionBinExport, ProgramBinExport
 
+from bindiff_mcp.files import write_text_atomic
+
 #: BinDiff scores structurally identical functions at 1.0; anything below
 #: changed instructions, basic blocks or edges.
 IDENTICAL_SIMILARITY = 1.0
@@ -102,7 +104,7 @@ def write_results(diff: BinDiff, output_dir: Path) -> dict[str, dict[str, Any]]:
     files: dict[str, Any] = {}
     for key, filename in RESULT_FILES.items():
         path = output_dir / filename
-        path.write_text(json.dumps(results[key], indent=2) + "\n", encoding="utf-8")
+        write_text_atomic(path, json.dumps(results[key], indent=2) + "\n")
         counts[key] = len(results[key])
         files[key] = str(path)
     return {"counts": counts, "files": files}

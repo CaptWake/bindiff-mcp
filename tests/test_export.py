@@ -1,4 +1,4 @@
-"""Export reuse rules, IDA worker snippet, and BinExport failure reporting."""
+"""Export reuse and locking, IDA worker snippet, and BinExport failure reporting."""
 
 from __future__ import annotations
 
@@ -6,6 +6,7 @@ import ast
 import json
 import os
 import sys
+import threading
 import types
 from pathlib import Path
 
@@ -15,6 +16,7 @@ from bindiff_mcp.errors import ExportError
 from bindiff_mcp.export import (
     _EXPORT_TEMPLATE,
     PLUGIN_NAMES,
+    ExportResult,
     _check_export,
     export_binary,
 )
@@ -199,7 +201,7 @@ def test_stale_export_is_replaced(tmp_path: Path, monkeypatch) -> None:
     os.utime(export, (binary.stat().st_atime - 10, binary.stat().st_mtime - 10))
     exported: list[tuple[Path, Path]] = []
 
-    def fake_run_export(source: Path, target: Path) -> None:
+    def fake_run_export(source: Path, target: Path, **_: object) -> None:
         # The stale file must be gone before IDA writes the new one.
         assert not target.exists()
         exported.append((source, target))
@@ -224,3 +226,48 @@ def test_missing_binary_is_rejected_before_ida_runs(
 
     with pytest.raises(ExportError, match="binary not found"):
         export_binary(tmp_path / "nope.bin", tmp_path)
+
+
+def test_concurrent_exports_of_one_binary_run_ida_once(
+    tmp_path: Path, monkeypatch
+) -> None:
+    binary = tmp_path / "sample.bin"
+    binary.write_bytes(b"\x7fELF")
+    output_dir = tmp_path / "out"
+    exporting = threading.Event()
+    finish = threading.Event()
+    exports: list[Path] = []
+
+    def slow_run_export(source: Path, target: Path, **_: object) -> None:
+        exports.append(target)
+        exporting.set()
+        assert finish.wait(5)
+        target.write_bytes(b"fresh")
+
+    monkeypatch.setattr("bindiff_mcp.export._run_export", slow_run_export)
+    results: list[ExportResult] = []
+    waiting = threading.Event()
+
+    def second_progress(state: str) -> None:
+        if state.startswith("waiting"):
+            waiting.set()
+
+    first = threading.Thread(
+        target=lambda: results.append(export_binary(binary, output_dir))
+    )
+    second = threading.Thread(
+        target=lambda: results.append(
+            export_binary(binary, output_dir, progress=second_progress)
+        )
+    )
+    first.start()
+    assert exporting.wait(5)
+    second.start()
+    # IDA Nexus would hand both callers one database; the second must wait.
+    assert waiting.wait(5)
+    finish.set()
+    first.join(5)
+    second.join(5)
+
+    assert len(exports) == 1
+    assert sorted(result.reused for result in results) == [False, True]

@@ -12,7 +12,9 @@ from __future__ import annotations
 import json
 import math
 import os
-from contextlib import suppress
+import threading
+from collections.abc import Callable, Generator
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from pathlib import Path
 from string import Template
@@ -21,6 +23,7 @@ from typing import Any
 from ida_nexus import DatabaseManager, NexusError, PythonExecutionResult
 
 from bindiff_mcp.errors import ExportError
+from bindiff_mcp.files import staging_path
 
 #: Extension of the files produced by the BinExport IDA plugin.
 BINEXPORT_SUFFIX = ".BinExport"
@@ -58,6 +61,15 @@ DATABASE_MANAGER = DatabaseManager(
     open_timeout=OPEN_TIMEOUT_SECONDS,
     execute_timeout=EXPORT_TIMEOUT_SECONDS,
 )
+
+#: One lock per binary and per BinExport path; see ``export_binary``.
+_PATH_LOCKS: dict[Path, threading.Lock] = {}
+_PATH_LOCKS_GUARD = threading.Lock()
+
+
+def _ignore_progress(_state: str) -> None:
+    """Progress sink for exports that run outside a job."""
+
 
 # Runs in the IDA process. ``json.dumps`` builds the IDC string literal so paths
 # containing backslashes or quotes survive the IDC parser. The trailing dict is
@@ -121,14 +133,18 @@ def export_binary(
     output_dir: str | Path,
     *,
     override: bool = False,
+    progress: Callable[[str], None] = _ignore_progress,
 ) -> ExportResult:
     """Export ``binary`` to ``<output_dir>/<binary name>.BinExport``.
 
     An export that is at least as new as the binary is reused unless
-    ``override`` is set, mirroring ``ProgramBinExport.generate``.
+    ``override`` is set, mirroring ``ProgramBinExport.generate``. A binary is
+    exported by one caller at a time, and a caller that had to wait reuses the
+    export it waited for: IDA Nexus hands every caller the same database for a
+    path, and the first one to finish would close it under the others.
     """
 
-    binary_path = _resolve_binary(binary)
+    binary_path = resolve_binary(binary)
     directory = Path(output_dir).expanduser()
     try:
         directory.mkdir(parents=True, exist_ok=True)
@@ -138,18 +154,21 @@ def export_binary(
         ) from error
     target = directory.resolve() / (binary_path.name + BINEXPORT_SUFFIX)
 
-    if not override and _is_current(target, binary_path):
-        return ExportResult(binary=binary_path, binexport=target, reused=True)
+    with _exclusively(binary_path, target, progress):
+        if not override and _is_current(target, binary_path):
+            progress("reused")
+            return ExportResult(binary=binary_path, binexport=target, reused=True)
 
-    # A stale export must not survive a failed run and be mistaken for fresh.
-    with suppress(OSError):
-        target.unlink(missing_ok=True)
+        # A stale export must not survive a failed run and be mistaken for fresh.
+        with suppress(OSError):
+            target.unlink(missing_ok=True)
 
-    _run_export(binary_path, target)
+        _run_export(binary_path, target, progress=progress)
+    progress("done")
     return ExportResult(binary=binary_path, binexport=target, reused=False)
 
 
-def _resolve_binary(binary: str | Path) -> Path:
+def resolve_binary(binary: str | Path) -> Path:
     path = Path(binary).expanduser()
     try:
         resolved = path.resolve(strict=True)
@@ -168,11 +187,40 @@ def _is_current(target: Path, binary: Path) -> bool:
         return False
 
 
-def _run_export(binary: Path, target: Path) -> None:
+@contextmanager
+def _exclusively(
+    binary: Path, target: Path, progress: Callable[[str], None]
+) -> Generator[None, None, None]:
+    """Hold the locks of ``binary`` and ``target``, always taken in path order."""
+    held: list[threading.Lock] = []
+    try:
+        for path in sorted({binary, target}):
+            with _PATH_LOCKS_GUARD:
+                lock = _PATH_LOCKS.setdefault(path, threading.Lock())
+            if not lock.acquire(blocking=False):
+                progress(f"waiting for another export of {binary.name}")
+                lock.acquire()
+            held.append(lock)
+        yield
+    finally:
+        for lock in reversed(held):
+            lock.release()
+
+
+def _run_export(
+    binary: Path,
+    target: Path,
+    *,
+    progress: Callable[[str], None] = _ignore_progress,
+) -> None:
+    # IDA writes a staging file that is renamed into place, so an export that
+    # is killed midway never leaves a truncated file that looks current.
+    staging = staging_path(target)
     code = _EXPORT_TEMPLATE.substitute(
-        output=json.dumps(str(target)),
+        output=json.dumps(str(staging)),
         plugins=json.dumps(list(PLUGIN_NAMES)),
     )
+    progress("opening")
     try:
         opened = DATABASE_MANAGER.open_database(str(binary), set_current=False)
     except (NexusError, OSError, ValueError) as error:
@@ -180,7 +228,9 @@ def _run_export(binary: Path, target: Path) -> None:
 
     instance_id = opened["instance_id"]
     try:
+        progress("autoanalysis")
         DATABASE_MANAGER.ensure_autoanalysis(instance_id)
+        progress("exporting")
         execution = DATABASE_MANAGER.execute_python(
             code,
             instance_id,
@@ -196,7 +246,12 @@ def _run_export(binary: Path, target: Path) -> None:
         with suppress(Exception):
             DATABASE_MANAGER.close_database(instance_id)
 
-    _check_export(binary, target, execution)
+    try:
+        _check_export(binary, staging, execution)
+        os.replace(staging, target)
+    finally:
+        with suppress(OSError):
+            staging.unlink(missing_ok=True)
 
 
 def _check_export(binary: Path, target: Path, execution: PythonExecutionResult) -> None:

@@ -13,3 +13,7 @@ class ExportError(BindiffMcpError):
 
 class DiffError(BindiffMcpError):
     """Two BinExport files could not be diffed, or the diff could not be read."""
+
+
+class UnknownJobError(BindiffMcpError):
+    """No job with the requested id was started by this server."""
