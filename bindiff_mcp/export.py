@@ -30,7 +30,7 @@ from ida_nexus import (
 )
 
 from bindiff_mcp.errors import ExportError, TimeLimitError
-from bindiff_mcp.files import staging_path
+from bindiff_mcp.files import sha256_file, staging_path
 from bindiff_mcp.limits import (
     ANALYSIS_TIMEOUT_SECONDS,
     EXPORT_TIMEOUT_SECONDS,
@@ -38,6 +38,7 @@ from bindiff_mcp.limits import (
     UNLIMITED,
     Deadline,
 )
+from bindiff_mcp.reader import exported_binary_sha256
 
 #: Extension of the files produced by the BinExport IDA plugin.
 BINEXPORT_SUFFIX = ".BinExport"
@@ -151,14 +152,19 @@ def export_binary(
 ) -> ExportResult:
     """Export ``binary`` to ``<output_dir>/<binary name>.BinExport``.
 
-    An export that is at least as new as the binary is reused unless
-    ``override`` is set, mirroring ``ProgramBinExport.generate``. A binary is
-    exported by one caller at a time, and a caller that had to wait reuses the
-    export it waited for: IDA Nexus hands every caller the same database for a
-    path, and the first one to finish would close it under the others.
+    An export made from the same bytes (it records their SHA-256) is reused
+    unless ``override`` is set; file dates prove nothing, as installers and
+    archives keep the original ones. A binary is exported by one caller at a
+    time, and a caller that had to wait reuses the export it waited for: IDA
+    Nexus hands every caller the same database for a path, and the first one to
+    finish would close it under the others.
     """
 
     binary_path = resolve_binary(binary)
+    try:
+        digest = sha256_file(binary_path)
+    except OSError as error:
+        raise ExportError(f"cannot read {binary_path}: {error}") from error
     directory = Path(output_dir).expanduser()
     try:
         directory.mkdir(parents=True, exist_ok=True)
@@ -169,7 +175,7 @@ def export_binary(
     target = directory.resolve() / (binary_path.name + BINEXPORT_SUFFIX)
 
     with _exclusively(binary_path, target, deadline, progress):
-        if not override and _is_current(target, binary_path):
+        if not override and exported_binary_sha256(target) == digest:
             progress("reused")
             return ExportResult(binary=binary_path, binexport=target, reused=True)
 
@@ -191,14 +197,6 @@ def resolve_binary(binary: str | Path) -> Path:
     if not resolved.is_file():
         raise ExportError(f"not a file: {resolved}")
     return resolved
-
-
-def _is_current(target: Path, binary: Path) -> bool:
-    """Report whether ``target`` is an export of the current ``binary`` bytes."""
-    try:
-        return target.stat().st_mtime >= binary.stat().st_mtime
-    except OSError:
-        return False
 
 
 @contextmanager

@@ -17,9 +17,13 @@ from pathlib import Path
 from bindiff.types import FunctionAlgorithm, function_algorithm_str
 from binexport.binexport2_pb2 import BinExport2  # ty: ignore[unresolved-import]
 from binexport.types import FunctionType
+from google.protobuf.message import DecodeError
 
 #: SQLite holds the unsigned 64-bit addresses of a BinDiff database as signed.
 _ADDRESS_MASK = (1 << 64) - 1
+
+#: The plugin writes the meta information first; it fits in this much of a file.
+_HEAD_BYTES = 64 * 1024
 
 
 @dataclass(frozen=True, slots=True)
@@ -63,6 +67,24 @@ class Diff:
     matches: list[FunctionMatch]
 
 
+def exported_binary_sha256(path: Path) -> str | None:
+    """SHA-256 of the binary a BinExport file was made from, or None if unreadable.
+
+    Only the head of the file is read, where the plugin writes the meta
+    information; a file laid out differently is parsed in full.
+    """
+    try:
+        with path.open("rb") as stream:
+            meta = _leading_meta(stream.read(_HEAD_BYTES))
+        if meta is None:
+            proto = BinExport2()
+            proto.ParseFromString(path.read_bytes())
+            meta = proto.meta_information
+    except (OSError, DecodeError):
+        return None
+    return meta.executable_id.lower() or None
+
+
 def read_program(path: Path) -> Program:
     """Read the functions of a BinExport file, listed as python-binexport does."""
     proto = BinExport2()
@@ -98,6 +120,32 @@ def read_program(path: Path) -> Program:
             for address in addresses
         },
     )
+
+
+def _leading_meta(head: bytes) -> BinExport2.Meta | None:
+    """Decode the meta information if it is the first field of a BinExport file."""
+    if head[:1] != b"\x0a":  # field 1 (meta_information), length-delimited
+        return None
+    length, start = _varint(head, 1)
+    if length is None or start + length > len(head):
+        return None
+    try:
+        return BinExport2.Meta.FromString(head[start : start + length])
+    except DecodeError:
+        return None
+
+
+def _varint(data: bytes, offset: int) -> tuple[int | None, int]:
+    value = 0
+    for shift in range(0, 64, 7):
+        if offset >= len(data):
+            break
+        byte = data[offset]
+        offset += 1
+        value |= (byte & 0x7F) << shift
+        if not byte & 0x80:
+            return value, offset
+    return None, offset
 
 
 def read_diff(path: Path) -> Diff:

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+import hashlib
 import json
 import os
 import signal
@@ -27,6 +28,10 @@ from bindiff_mcp.export import (
     export_binary,
 )
 from bindiff_mcp.limits import Deadline
+from tests.fixtures import NORMAL, write_binexport
+
+_ELF = b"\x7fELF"
+_ELF_SHA256 = hashlib.sha256(_ELF).hexdigest()
 
 
 def _execution(result: object, stdout: str = "", stderr: str = "") -> dict:
@@ -176,43 +181,54 @@ def test_check_export_accepts_eok_and_an_unset_idc_value(
     )
 
 
-def test_export_is_reused_when_newer_than_the_binary(
+def _export_of(path: Path, digest: str) -> Path:
+    """A BinExport file that records ``digest`` as its binary's SHA-256."""
+    return write_binexport(
+        path, "sample.bin", [(0x401000, "main", NORMAL)], executable_id=digest
+    )
+
+
+def test_an_export_of_the_same_bytes_is_reused_whatever_its_date(
     tmp_path: Path, monkeypatch
 ) -> None:
     binary = tmp_path / "sample.bin"
-    binary.write_bytes(b"\x7fELF")
+    binary.write_bytes(_ELF)
     output_dir = tmp_path / "out"
     output_dir.mkdir()
-    export = output_dir / "sample.bin.BinExport"
-    export.write_bytes(b"cached")
-    os.utime(export, (binary.stat().st_atime + 10, binary.stat().st_mtime + 10))
+    export = _export_of(output_dir / "sample.bin.BinExport", _ELF_SHA256)
+    # Older than the binary: installers and archives keep their original dates.
+    os.utime(export, (binary.stat().st_atime - 10, binary.stat().st_mtime - 10))
+    contents = export.read_bytes()
     monkeypatch.setattr(
         "bindiff_mcp.export._run_export",
-        lambda *_: pytest.fail("IDA must not run for a current export"),
+        lambda *_, **__: pytest.fail("IDA must not run for an export of these bytes"),
     )
 
     result = export_binary(binary, output_dir)
 
     assert result.reused is True
     assert result.binexport == export
-    assert export.read_bytes() == b"cached"
+    assert export.read_bytes() == contents
 
 
-def test_stale_export_is_replaced(tmp_path: Path, monkeypatch) -> None:
+def test_an_export_of_other_bytes_is_replaced_whatever_its_date(
+    tmp_path: Path, monkeypatch
+) -> None:
     binary = tmp_path / "sample.bin"
-    binary.write_bytes(b"\x7fELF")
+    binary.write_bytes(_ELF)
     output_dir = tmp_path / "out"
     output_dir.mkdir()
-    export = output_dir / "sample.bin.BinExport"
-    export.write_bytes(b"stale")
-    os.utime(export, (binary.stat().st_atime - 10, binary.stat().st_mtime - 10))
+    other_build = hashlib.sha256(b"another build").hexdigest()
+    export = _export_of(output_dir / "sample.bin.BinExport", other_build)
+    # Newer than the binary, which used to be enough to reuse it.
+    os.utime(export, (binary.stat().st_atime + 10, binary.stat().st_mtime + 10))
     exported: list[tuple[Path, Path]] = []
 
     def fake_run_export(source: Path, target: Path, **_: object) -> None:
         # The stale file must be gone before IDA writes the new one.
         assert not target.exists()
         exported.append((source, target))
-        target.write_bytes(b"fresh")
+        _export_of(target, _ELF_SHA256)
 
     monkeypatch.setattr("bindiff_mcp.export._run_export", fake_run_export)
 
@@ -220,7 +236,6 @@ def test_stale_export_is_replaced(tmp_path: Path, monkeypatch) -> None:
 
     assert result.reused is False
     assert exported == [(binary.resolve(), export)]
-    assert export.read_bytes() == b"fresh"
 
 
 def test_missing_binary_is_rejected_before_ida_runs(
@@ -239,7 +254,7 @@ def test_concurrent_exports_of_one_binary_run_ida_once(
     tmp_path: Path, monkeypatch
 ) -> None:
     binary = tmp_path / "sample.bin"
-    binary.write_bytes(b"\x7fELF")
+    binary.write_bytes(_ELF)
     output_dir = tmp_path / "out"
     exporting = threading.Event()
     finish = threading.Event()
@@ -249,7 +264,7 @@ def test_concurrent_exports_of_one_binary_run_ida_once(
         exports.append(target)
         exporting.set()
         assert finish.wait(5)
-        target.write_bytes(b"fresh")
+        _export_of(target, _ELF_SHA256)
 
     monkeypatch.setattr("bindiff_mcp.export._run_export", slow_run_export)
     results: list[ExportResult] = []

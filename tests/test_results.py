@@ -7,8 +7,15 @@ from pathlib import Path
 from typing import NamedTuple
 
 import pytest
+from binexport.binexport2_pb2 import BinExport2  # ty: ignore[unresolved-import]
 
-from bindiff_mcp.reader import Diff, Program, read_diff, read_program
+from bindiff_mcp.reader import (
+    Diff,
+    Program,
+    exported_binary_sha256,
+    read_diff,
+    read_program,
+)
 from bindiff_mcp.results import (
     RESULT_FILES,
     collect_results,
@@ -147,3 +154,25 @@ def test_files_with_url_characters_in_their_path_are_read(tmp_path: Path) -> Non
     assert len(read_program(primary).functions) == 5
     assert len(read_program(secondary).functions) == 5
     assert [path.name for path in tmp_path.iterdir()] == [directory.name]
+
+
+def test_the_source_hash_is_read_wherever_the_meta_information_is(
+    tmp_path: Path,
+) -> None:
+    export = write_binexport(
+        tmp_path / "first.BinExport",
+        "sample.bin",
+        [(0x401000, "main", NORMAL)],
+        executable_id="AB" * 32,
+    )
+    # Protobuf merges concatenated messages, so this file is equally valid
+    # with the meta information last instead of first.
+    program = BinExport2.FromString(export.read_bytes())
+    meta_last = BinExport2(meta_information=program.meta_information)
+    program.ClearField("meta_information")
+    reordered = tmp_path / "last.BinExport"
+    reordered.write_bytes(program.SerializeToString() + meta_last.SerializeToString())
+
+    assert exported_binary_sha256(export) == "ab" * 32
+    assert exported_binary_sha256(reordered) == "ab" * 32
+    assert exported_binary_sha256(tmp_path / "missing.BinExport") is None

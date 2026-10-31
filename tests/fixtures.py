@@ -12,12 +12,16 @@ IMPORTED = BinExport2.CallGraph.Vertex.IMPORTED
 
 
 def write_binexport(
-    path: Path, name: str, functions: list[tuple[int, str, int]]
+    path: Path,
+    name: str,
+    functions: list[tuple[int, str, int]],
+    *,
+    executable_id: str | None = None,
 ) -> Path:
     """Write a minimal BinExport file with one basic block per function."""
     program = BinExport2()
     program.meta_information.executable_name = name
-    program.meta_information.executable_id = f"sha256-of-{name}"
+    program.meta_information.executable_id = executable_id or f"sha256-of-{name}"
     program.meta_information.architecture_name = "x86-64"
     for address, function_name, vertex_type in functions:
         vertex = program.call_graph.vertex.add()

@@ -73,7 +73,8 @@ starts again from the binary or from the last saved `.i64`.
 ### `binexport(binary, output_results_dir=".", wait_seconds=20)`
 
 Exports `binary` to `<output_results_dir>/<binary name>.BinExport`. An export
-that is at least as new as the binary is reused instead of re-analyzing it.
+made from the same bytes (it records their SHA-256) is reused instead of
+re-analyzing the binary; file dates are not trusted.
 The job's `result`:
 
 ```json

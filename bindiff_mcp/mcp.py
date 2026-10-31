@@ -118,9 +118,10 @@ def binexport(
     Export the binary using the binexport tool from IDA
 
     The binary is analyzed by IDA Pro and written as
-    ``<output_results_dir>/<binary name>.BinExport``. An export that is newer
-    than the binary is reused instead of re-analyzing it. The finished job's
-    "result" holds the export path, architecture, SHA-256 and function count.
+    ``<output_results_dir>/<binary name>.BinExport``. An export made from the
+    same bytes (same SHA-256) is reused instead of re-analyzing the binary. The
+    finished job's "result" holds the export path, architecture, SHA-256 and
+    function count.
 
     Runs as a job: when it has not finished within wait_seconds, the call
     returns the job_id, status and stage instead; call bindiff_job(job_id)
