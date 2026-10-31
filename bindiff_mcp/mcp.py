@@ -147,7 +147,10 @@ def bindiff_compare(
 ) -> str:
     """
     Compares two binary files using IDA Pro and BinDiff.
-    Resulting detailed difference lists are saved to the specified directory (default: current directory).
+    Resulting detailed difference lists are saved to a folder of their own inside
+    output_results_dir (default: current directory), named
+    <primary>_vs_<secondary>-<hash of both binaries>, so comparing other builds
+    never overwrites earlier results.
     Generated files:
     1. matched_similar.json (Identical functions)
     2. matched_different.json (Matched but Changed functions)
@@ -156,8 +159,9 @@ def bindiff_compare(
 
     Both binaries are exported in parallel, diffed with BinDiff, and the match
     lists are written as JSON. matched_different.json is ordered by similarity,
-    most divergent first. The finished job's "result" holds the overall
-    similarity and confidence, per-list counts and the path of every file written.
+    most divergent first. The finished job's "result" holds the result folder,
+    the overall similarity and confidence, per-list counts and the path of every
+    file written.
 
     Runs as a job: when it has not finished within wait_seconds, the call
     returns the job_id, status and stage instead; call bindiff_job(job_id)

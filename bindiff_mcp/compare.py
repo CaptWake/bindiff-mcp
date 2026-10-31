@@ -6,9 +6,11 @@ which runs the exports, the differ and the result files on a worker thread.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import os
+import re
 import sqlite3
 import subprocess
 import tempfile
@@ -43,6 +45,9 @@ _BINDIFF_MISSING = (
 #: Longest differ output kept in an error message.
 _OUTPUT_EXCERPT_CHARS = 2000
 
+#: Longest part of a folder or file name taken from a binary's name.
+_NAME_CHARS = 48
+
 
 def export_request(binary: str, output_results_dir: str) -> JobRequest:
     """Validate a ``binexport`` call and describe the job that answers it."""
@@ -63,7 +68,7 @@ def export_request(binary: str, output_results_dir: str) -> JobRequest:
 
     return JobRequest(
         tool="binexport",
-        key=_request_key("binexport", directory, binary_path),
+        key=_request_key("binexport", directory, _sha256(binary_path)),
         arguments={"binary": str(binary_path), "output_results_dir": str(directory)},
         work=work,
     )
@@ -78,6 +83,10 @@ def compare_request(
     primary_path = resolve_binary(primary_binary)
     secondary_path = resolve_binary(secondary_binary)
     directory = _output_directory(output_results_dir)
+    digests = (_sha256(primary_path), _sha256(secondary_path))
+    # Every pair gets a folder, so comparing other builds into the same output
+    # directory never overwrites earlier results.
+    results_dir = directory / _pair_folder(primary_path, secondary_path, digests)
     # Fail before spending minutes on autoanalysis if the differ is missing.
     differ = _differ_path()
 
@@ -86,25 +95,27 @@ def compare_request(
         primary, secondary = _in_parallel(
             lambda: export_binary(
                 primary_path,
-                directory / PRIMARY_DIR,
+                results_dir / PRIMARY_DIR,
                 deadline=context.deadline,
                 progress=context.export_progress("primary"),
             ),
             lambda: export_binary(
                 secondary_path,
-                directory / SECONDARY_DIR,
+                results_dir / SECONDARY_DIR,
                 deadline=context.deadline,
                 progress=context.export_progress("secondary"),
             ),
         )
         context.stage("diffing")
-        diff_file = _run_differ(differ, primary, secondary, directory, context.deadline)
+        diff_file = _run_differ(
+            differ, primary, secondary, results_dir, context.deadline
+        )
         context.stage("writing results")
-        return _diff_results(primary, secondary, diff_file, directory)
+        return _diff_results(primary, secondary, diff_file, results_dir)
 
     return JobRequest(
         tool="bindiff_compare",
-        key=_request_key("bindiff_compare", directory, primary_path, secondary_path),
+        key=_request_key("bindiff_compare", directory, *digests),
         arguments={
             "primary_binary": str(primary_path),
             "secondary_binary": str(secondary_path),
@@ -112,6 +123,17 @@ def compare_request(
         },
         work=work,
     )
+
+
+def _pair_folder(primary: Path, secondary: Path, digests: tuple[str, str]) -> str:
+    """Name of a pair's result folder: both binary names, then a hash of both."""
+    pair = hashlib.sha256("".join(digests).encode()).hexdigest()[:12]
+    return f"{_safe_name(primary.name)}_vs_{_safe_name(secondary.name)}-{pair}"
+
+
+def _safe_name(name: str) -> str:
+    """``name`` reduced to characters that every filesystem and URI takes as is."""
+    return re.sub(r"[^A-Za-z0-9._-]+", "_", name).strip("._")[:_NAME_CHARS] or "binary"
 
 
 def _output_directory(output_results_dir: str) -> Path:
@@ -125,14 +147,15 @@ def _output_directory(output_results_dir: str) -> Path:
     return directory.resolve()
 
 
-def _request_key(tool: str, directory: Path, *binaries: Path) -> str:
+def _sha256(binary: Path) -> str:
+    try:
+        return sha256_file(binary)
+    except OSError as error:
+        raise ExportError(f"cannot read {binary}: {error}") from error
+
+
+def _request_key(tool: str, directory: Path, *digests: str) -> str:
     """Requests are identical when tool, output directory and binary bytes match."""
-    digests = []
-    for binary in binaries:
-        try:
-            digests.append(sha256_file(binary))
-        except OSError as error:
-            raise ExportError(f"cannot read {binary}: {error}") from error
     return json.dumps([tool, str(directory), *digests])
 
 
@@ -196,7 +219,9 @@ def _run_differ(
     deadline: Deadline,
 ) -> Path:
     """Diff the two exports into ``<directory>/<primary>_vs_<secondary>.BinDiff``."""
-    diff_file = directory / f"{primary.binary.name}_vs_{secondary.binary.name}.BinDiff"
+    primary_name = _safe_name(primary.binary.name)
+    secondary_name = _safe_name(secondary.binary.name)
+    diff_file = directory / f"{primary_name}_vs_{secondary_name}.BinDiff"
     remaining = deadline.remaining("diffing")
     # The differ writes into a scratch directory beside the result, so the
     # finished database is renamed into place and never seen half-written.
@@ -266,6 +291,7 @@ def _diff_results(
         collect_results(diff, primary_program, secondary_program), directory
     )
     return {
+        "results_dir": str(directory),
         "primary": {**_export_fields(primary), **program_metadata(primary_program)},
         "secondary": {
             **_export_fields(secondary),

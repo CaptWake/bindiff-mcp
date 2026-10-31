@@ -93,9 +93,13 @@ another file of the same name is discarded. The job's `result`:
 
 ### `bindiff_compare(primary_binary, secondary_binary, output_results_dir=".", wait_seconds=20)`
 
-Exports both binaries in parallel (into `primary/` and `secondary/`
-subdirectories, so identical file names cannot collide), runs the differ, and
-writes four JSON files into `output_results_dir`:
+Exports both binaries in parallel, runs the differ, and writes everything into a
+folder of its own inside `output_results_dir`, named
+`<primary>_vs_<secondary>-<hash>`: the names come from the binaries (reduced to
+`A-Z a-z 0-9 . _ -`) and the hash from their bytes. Comparing other builds into
+the same directory therefore never overwrites earlier results, and repeating a
+comparison reuses its exports. The folder holds `primary/` and `secondary/`
+(each export with its IDA database), the `.BinDiff` database and four JSON files:
 
 | File                     | Content                                                   |
 | ------------------------ | --------------------------------------------------------- |
@@ -106,9 +110,9 @@ writes four JSON files into `output_results_dir`:
 
 Match entries carry both addresses and names, the similarity and confidence
 scores and the BinDiff algorithm that produced the match; unmatched entries
-carry address, name and function type. The job's `result` holds the overall
-similarity and confidence, the `.BinDiff` database path, per-list counts and the
-path of every file written.
+carry address, name and function type. The job's `result` holds the result
+folder (`results_dir`), the overall similarity and confidence, the `.BinDiff`
+database path, per-list counts and the path of every file written.
 
 ### `bindiff_job(job_id, wait_seconds=20)`
 
