@@ -4,10 +4,11 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from typing import NamedTuple
 
 import pytest
-from bindiff import BinDiff
 
+from bindiff_mcp.reader import Diff, Program, read_diff, read_program
 from bindiff_mcp.results import (
     RESULT_FILES,
     collect_results,
@@ -17,10 +18,15 @@ from bindiff_mcp.results import (
 from tests.fixtures import IMPORTED, NORMAL, write_bindiff_database, write_binexport
 
 
-@pytest.fixture
-def diff(tmp_path: Path) -> BinDiff:
+class Loaded(NamedTuple):
+    diff: Diff
+    primary: Program
+    secondary: Program
+
+
+def _write_pair(directory: Path) -> tuple[Path, Path, Path]:
     primary = write_binexport(
-        tmp_path / "primary.bin.BinExport",
+        directory / "primary.bin.BinExport",
         "primary.bin",
         [
             (0x401000, "untouched", NORMAL),
@@ -31,7 +37,7 @@ def diff(tmp_path: Path) -> BinDiff:
         ],
     )
     secondary = write_binexport(
-        tmp_path / "secondary.bin.BinExport",
+        directory / "secondary.bin.BinExport",
         "secondary.bin",
         [
             (0x501000, "untouched", NORMAL),
@@ -42,7 +48,7 @@ def diff(tmp_path: Path) -> BinDiff:
         ],
     )
     database = write_bindiff_database(
-        tmp_path / "primary_vs_secondary.BinDiff",
+        directory / "primary_vs_secondary.BinDiff",
         [
             (0x401200, "refactored", 0x501200, "refactored", 0.91, 0.95),
             (0x401000, "untouched", 0x501000, "untouched", 1.0, 0.99),
@@ -50,11 +56,17 @@ def diff(tmp_path: Path) -> BinDiff:
             (0x402000, "memcpy", 0x502000, "memcpy", 1.0, 0.99),
         ],
     )
-    return BinDiff(str(primary), str(secondary), database)
+    return primary, secondary, database
 
 
-def test_identical_matches_are_separated_at_similarity_one(diff: BinDiff) -> None:
-    results = collect_results(diff)
+@pytest.fixture
+def loaded(tmp_path: Path) -> Loaded:
+    primary, secondary, database = _write_pair(tmp_path)
+    return Loaded(read_diff(database), read_program(primary), read_program(secondary))
+
+
+def test_identical_matches_are_separated_at_similarity_one(loaded: Loaded) -> None:
+    results = collect_results(*loaded)
 
     assert [entry["primary_address"] for entry in results["matched_similar"]] == [
         "0x401000",
@@ -64,8 +76,8 @@ def test_identical_matches_are_separated_at_similarity_one(diff: BinDiff) -> Non
     assert all(entry["similarity"] < 1.0 for entry in results["matched_different"])
 
 
-def test_changed_matches_are_ordered_most_divergent_first(diff: BinDiff) -> None:
-    changed = collect_results(diff)["matched_different"]
+def test_changed_matches_are_ordered_most_divergent_first(loaded: Loaded) -> None:
+    changed = collect_results(*loaded)["matched_different"]
 
     assert [entry["similarity"] for entry in changed] == [0.42, 0.91]
     assert changed[0] == {
@@ -79,8 +91,8 @@ def test_changed_matches_are_ordered_most_divergent_first(diff: BinDiff) -> None
     }
 
 
-def test_unmatched_functions_are_reported_per_side(diff: BinDiff) -> None:
-    results = collect_results(diff)
+def test_unmatched_functions_are_reported_per_side(loaded: Loaded) -> None:
+    results = collect_results(*loaded)
 
     assert results["primary_only"] == [
         {"address": "0x401300", "name": "removed_helper", "type": "normal"}
@@ -91,12 +103,12 @@ def test_unmatched_functions_are_reported_per_side(diff: BinDiff) -> None:
 
 
 def test_write_results_writes_every_file_with_matching_counts(
-    diff: BinDiff, tmp_path: Path
+    loaded: Loaded, tmp_path: Path
 ) -> None:
     output_dir = tmp_path / "results"
     output_dir.mkdir()
 
-    summary = write_results(diff, output_dir)
+    summary = write_results(collect_results(*loaded), output_dir)
 
     assert summary["counts"] == {
         "matched_similar": 2,
@@ -112,10 +124,26 @@ def test_write_results_writes_every_file_with_matching_counts(
         )
 
 
-def test_program_metadata_reports_export_identity(diff: BinDiff) -> None:
-    assert program_metadata(diff.primary) == {
+def test_program_metadata_reports_export_identity(loaded: Loaded) -> None:
+    assert program_metadata(loaded.primary) == {
         "name": "primary.bin",
         "architecture": "x86-64",
         "sha256": "sha256-of-primary.bin",
         "functions": 5,
     }
+
+
+def test_files_with_url_characters_in_their_path_are_read(tmp_path: Path) -> None:
+    plain = tmp_path / "plain"
+    plain.mkdir()
+    written = _write_pair(plain)
+    # Renamed afterwards: python-bindiff cannot create a database at such a path.
+    directory = plain.rename(tmp_path / "C# builds?v=2 100%41")
+    primary, secondary, database = (directory / path.name for path in written)
+
+    diff = read_diff(database)
+
+    assert (diff.similarity, len(diff.matches)) == (0.75, 4)
+    assert len(read_program(primary).functions) == 5
+    assert len(read_program(secondary).functions) == 5
+    assert [path.name for path in tmp_path.iterdir()] == [directory.name]

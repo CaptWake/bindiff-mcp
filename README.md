@@ -7,9 +7,11 @@ with [BinDiff](https://github.com/google/bindiff).
 IDA is driven through [ida-nexus](https://pypi.org/project/ida-nexus/), so a
 binary already open in the IDA GUI is exported from that database (renames and
 annotations included); otherwise a headless idalib worker is spawned and
-released again when the export finishes. Export and diff parsing reuse
-[python-binexport](https://pypi.org/project/python-binexport/) and
-[python-bindiff](https://pypi.org/project/python-bindiff/).
+released again when the export finishes. Exports and diffs are read at function
+level only, using the schema of
+[python-binexport](https://pypi.org/project/python-binexport/) and the
+algorithm names of [python-bindiff](https://pypi.org/project/python-bindiff/);
+basic block and instruction matches are never loaded.
 
 ## Prerequisites
 

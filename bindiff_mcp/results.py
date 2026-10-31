@@ -1,4 +1,4 @@
-"""Turn a parsed BinDiff database into the JSON result files agents consume."""
+"""Turn a BinDiff database and its two exports into the JSON result files."""
 
 from __future__ import annotations
 
@@ -6,12 +6,8 @@ import json
 from pathlib import Path
 from typing import Any
 
-from bindiff import BinDiff
-from bindiff.file import FunctionMatch
-from bindiff.types import function_algorithm_str
-from binexport import FunctionBinExport, ProgramBinExport
-
 from bindiff_mcp.files import write_text_atomic
+from bindiff_mcp.reader import Diff, Function, FunctionMatch, Program
 
 #: BinDiff scores structurally identical functions at 1.0; anything below
 #: changed instructions, basic blocks or edges.
@@ -26,21 +22,18 @@ RESULT_FILES: dict[str, str] = {
 }
 
 
-def program_metadata(program: ProgramBinExport) -> dict[str, Any]:
+def program_metadata(program: Program) -> dict[str, Any]:
     """Summarize an exported program for a tool response."""
-    meta = program.proto.meta_information
     return {
         "name": program.name,
         "architecture": program.architecture,
-        "sha256": meta.executable_id,
-        "functions": len(program),
+        "sha256": program.sha256,
+        "functions": len(program.functions),
     }
 
 
 def match_entry(
-    primary: FunctionBinExport,
-    secondary: FunctionBinExport,
-    match: FunctionMatch,
+    match: FunctionMatch, primary: Function, secondary: Function
 ) -> dict[str, Any]:
     """Describe one matched function pair."""
     return {
@@ -50,25 +43,35 @@ def match_entry(
         "secondary_name": match.name2 or secondary.name,
         "similarity": round(match.similarity, 4),
         "confidence": round(match.confidence, 4),
-        "algorithm": function_algorithm_str(match.algorithm),
+        "algorithm": match.algorithm,
     }
 
 
-def function_entry(function: FunctionBinExport) -> dict[str, Any]:
+def function_entry(function: Function) -> dict[str, Any]:
     """Describe one unmatched function."""
     return {
-        "address": hex(function.addr),
+        "address": hex(function.address),
         "name": function.name,
-        "type": function.type.name.lower() if function.type else "unknown",
+        "type": function.type,
     }
 
 
-def split_matches(diff: BinDiff) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    """Split function matches into identical and changed pairs."""
+def collect_results(
+    diff: Diff, primary: Program, secondary: Program
+) -> dict[str, list[dict[str, Any]]]:
+    """Build every result list from a BinDiff database and its two exports."""
+    # One match per address and side; a later row replaces an earlier one.
+    by_primary = {match.address1: match for match in diff.matches}
+    by_secondary = {match.address2: match for match in diff.matches}
+
     identical: list[dict[str, Any]] = []
     changed: list[tuple[float, int, dict[str, Any]]] = []
-    for primary, secondary, match in diff.iter_function_matches():
-        entry = match_entry(primary, secondary, match)
+    for match in by_primary.values():
+        first = primary.functions.get(match.address1)
+        second = secondary.functions.get(match.address2)
+        if first is None or second is None:
+            continue  # a match for a function the export does not list
+        entry = match_entry(match, first, second)
         if match.similarity >= IDENTICAL_SIMILARITY:
             identical.append(entry)
         else:
@@ -76,30 +79,28 @@ def split_matches(diff: BinDiff) -> tuple[list[dict[str, Any]], list[dict[str, A
     identical.sort(key=lambda entry: int(entry["primary_address"], 16))
     # Most divergent matches first: that is where a patch analysis starts.
     changed.sort(key=lambda item: (item[0], item[1]))
-    return identical, [entry for _, _, entry in changed]
-
-
-def unmatched_entries(functions: list[FunctionBinExport]) -> list[dict[str, Any]]:
-    """Describe unmatched functions, ordered by address."""
-    return [
-        function_entry(function) for function in sorted(functions, key=lambda f: f.addr)
-    ]
-
-
-def collect_results(diff: BinDiff) -> dict[str, list[dict[str, Any]]]:
-    """Build every result list from a loaded BinDiff database."""
-    identical, changed = split_matches(diff)
     return {
         "matched_similar": identical,
-        "matched_different": changed,
-        "primary_only": unmatched_entries(diff.primary_unmatched_function()),
-        "secondary_only": unmatched_entries(diff.secondary_unmatched_function()),
+        "matched_different": [entry for _, _, entry in changed],
+        "primary_only": _unmatched(primary, by_primary),
+        "secondary_only": _unmatched(secondary, by_secondary),
     }
 
 
-def write_results(diff: BinDiff, output_dir: Path) -> dict[str, dict[str, Any]]:
+def _unmatched(
+    program: Program, matched: dict[int, FunctionMatch]
+) -> list[dict[str, Any]]:
+    return [
+        function_entry(function)
+        for address, function in sorted(program.functions.items())
+        if address not in matched
+    ]
+
+
+def write_results(
+    results: dict[str, list[dict[str, Any]]], output_dir: Path
+) -> dict[str, dict[str, Any]]:
     """Write the four result files and report their sizes and paths."""
-    results = collect_results(diff)
     counts: dict[str, Any] = {}
     files: dict[str, Any] = {}
     for key, filename in RESULT_FILES.items():

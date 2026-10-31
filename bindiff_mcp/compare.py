@@ -21,14 +21,14 @@ from typing import Any
 import bindiff.bindiff as bindiff_module
 from bindiff import BinDiff
 from bindiff.types import BindiffNotFound
-from binexport import ProgramBinExport
 
 from bindiff_mcp.errors import DiffError, ExportError, TimeLimitError
 from bindiff_mcp.export import ExportResult, export_binary, resolve_binary
 from bindiff_mcp.files import sha256_file
 from bindiff_mcp.jobs import JobContext, JobRequest
 from bindiff_mcp.limits import Deadline
-from bindiff_mcp.results import program_metadata, write_results
+from bindiff_mcp.reader import Program, read_diff, read_program
+from bindiff_mcp.results import collect_results, program_metadata, write_results
 
 #: The two binaries are exported into separate directories so that diffing two
 #: builds of the same file name cannot overwrite one another's BinExport.
@@ -173,9 +173,9 @@ def _in_parallel(
     return first_result, outcome["result"]
 
 
-def _open_program(binexport: Path) -> ProgramBinExport:
+def _open_program(binexport: Path) -> Program:
     try:
-        return ProgramBinExport.open(binexport)
+        return read_program(binexport)
     except Exception as error:  # protobuf parsing raises broadly
         raise ExportError(f"cannot read BinExport file {binexport}: {error}") from error
 
@@ -256,14 +256,21 @@ def _diff_results(
     primary: ExportResult, secondary: ExportResult, diff_file: Path, directory: Path
 ) -> dict[str, Any]:
     try:
-        diff = BinDiff(str(primary.binexport), str(secondary.binexport), str(diff_file))
-    except Exception as error:  # protobuf and sqlite raise broadly
+        diff = read_diff(diff_file)
+    except Exception as error:  # sqlite raises broadly
         raise DiffError(f"cannot read {diff_file.name}: {error}") from error
+    primary_program = _open_program(primary.binexport)
+    secondary_program = _open_program(secondary.binexport)
 
-    results = write_results(diff, directory)
+    results = write_results(
+        collect_results(diff, primary_program, secondary_program), directory
+    )
     return {
-        "primary": {**_export_fields(primary), **program_metadata(diff.primary)},
-        "secondary": {**_export_fields(secondary), **program_metadata(diff.secondary)},
+        "primary": {**_export_fields(primary), **program_metadata(primary_program)},
+        "secondary": {
+            **_export_fields(secondary),
+            **program_metadata(secondary_program),
+        },
         "diff_file": str(diff_file),
         "similarity": diff.similarity,
         "confidence": diff.confidence,
