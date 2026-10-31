@@ -11,8 +11,8 @@ IDA can spend tens of minutes on a large binary, so the first two run as
 background jobs: a call answers within ``wait_seconds`` with the result or with
 the job to poll, and no client request timeout can cut an analysis short.
 
-Exports run through IDA Nexus, so a binary already open in the IDA GUI is
-exported from that database; otherwise a headless idalib worker is spawned.
+Exports run in headless idalib workers started through IDA Nexus; each keeps its
+IDA database in the output folder, next to the export.
 IDA Pro, the BinExport IDA plugin and the BinDiff differ must be installed.
 """
 

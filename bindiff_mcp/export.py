@@ -2,9 +2,9 @@
 
 The BinExport IDA plugin registers the ``BinExportBinary(path)`` IDC function
 when it initializes. Instead of spawning ``idat`` directly (what
-``binexport.ProgramBinExport.generate`` does), the export runs inside the IDA
-Nexus session that already owns the database: an existing IDA GUI instance when
-the binary is open there, otherwise a headless idalib worker.
+``binexport.ProgramBinExport.generate`` does), every export runs in a headless
+idalib worker started through IDA Nexus, whose database is kept in the output
+folder next to the export.
 """
 
 from __future__ import annotations
@@ -24,6 +24,7 @@ from typing import Any
 
 from ida_nexus import (
     DatabaseManager,
+    DatabaseOpenOptions,
     NexusError,
     PythonExecutionResult,
     probe_database_state,
@@ -42,6 +43,9 @@ from bindiff_mcp.reader import exported_binary_sha256
 
 #: Extension of the files produced by the BinExport IDA plugin.
 BINEXPORT_SUFFIX = ".BinExport"
+
+#: Extension IDA gives its databases; one sits next to each export.
+DATABASE_SUFFIX = ".i64"
 
 #: Plugin names tried when the IDC extension is not registered in the session.
 PLUGIN_NAMES = ("binexport12_ida", "binexport11_ida")
@@ -183,7 +187,7 @@ def export_binary(
         with suppress(OSError):
             target.unlink(missing_ok=True)
 
-        _run_export(binary_path, target, deadline=deadline, progress=progress)
+        _run_export(binary_path, target, digest, deadline=deadline, progress=progress)
     progress("done")
     return ExportResult(binary=binary_path, binexport=target, reused=False)
 
@@ -242,13 +246,41 @@ def _time_limit(stage: str, timeout: float) -> Generator[None, None, None]:
 def _run_export(
     binary: Path,
     target: Path,
+    digest: str,
     *,
     deadline: Deadline = UNLIMITED,
     progress: Callable[[str], None] = _ignore_progress,
 ) -> None:
+    # The IDA database lives next to the export, never beside the binary: that
+    # folder may be read-only, open in another IDA session, or hold a database
+    # of an older build.
+    database = target.with_suffix(DATABASE_SUFFIX)
     # IDA writes a staging file that is renamed into place, so an export that
     # is killed midway never leaves a truncated file that looks current.
     staging = staging_path(target)
+    try:
+        reopened = database.exists()
+        _export(binary, staging, database, deadline, progress)
+        if reopened and exported_binary_sha256(staging) != digest:
+            # The database in the output folder was built from another file
+            # of the same name: start over from the binary.
+            progress("discarding a database of another build")
+            staging.unlink(missing_ok=True)
+            _discard_database(binary, database)
+            _export(binary, staging, database, deadline, progress)
+        os.replace(staging, target)
+    finally:
+        with suppress(OSError):
+            staging.unlink(missing_ok=True)
+
+
+def _export(
+    binary: Path,
+    staging: Path,
+    database: Path,
+    deadline: Deadline,
+    progress: Callable[[str], None],
+) -> None:
     code = _EXPORT_TEMPLATE.substitute(
         output=json.dumps(str(staging)),
         plugins=json.dumps(list(PLUGIN_NAMES)),
@@ -256,7 +288,11 @@ def _run_export(
     progress("opening")
     deadline.remaining(f"opening {binary.name}")
     try:
-        opened = DATABASE_MANAGER.open_database(str(binary), set_current=False)
+        opened = DATABASE_MANAGER.open_database(
+            str(binary),
+            set_current=False,
+            options=DatabaseOpenOptions(output_database=str(database)),
+        )
     except (NexusError, OSError, ValueError) as error:
         raise ExportError(f"IDA could not open {binary.name}: {error}") from error
 
@@ -294,17 +330,24 @@ def _run_export(
             DATABASE_MANAGER.close_database(instance_id)
         worker = _WORKER_PIDS.pop(instance_id, None)
         if timed_out and worker is not None:
-            _stop_worker(worker, binary)
+            _stop_worker(worker, binary, database)
 
+    _check_export(binary, staging, execution)
+
+
+def _discard_database(binary: Path, database: Path) -> None:
+    """Delete ``database`` and any unpacked parts so the next open starts over."""
+    state = probe_database_state(binary, output_database=database)
+    if state["state"] == "in_use":
+        raise ExportError(f"another IDA session has {database} open")
     try:
-        _check_export(binary, staging, execution)
-        os.replace(staging, target)
-    finally:
-        with suppress(OSError):
-            staging.unlink(missing_ok=True)
+        for path in (database, *map(Path, state["unpacked_files"])):
+            path.unlink(missing_ok=True)
+    except OSError as error:
+        raise ExportError(f"cannot remove the database {database}: {error}") from error
 
 
-def _stop_worker(pid: int, binary: Path) -> None:
+def _stop_worker(pid: int, binary: Path, database: Path) -> None:
     """Make sure the worker of a stage that ran out of time is gone.
 
     IDA cannot interrupt autoanalysis or an export underway, and a worker whose
@@ -322,7 +365,7 @@ def _stop_worker(pid: int, binary: Path) -> None:
     # Nexus would repair the half-analyzed leftovers into a database whose
     # functions differ from a full analysis. Without them the next open starts
     # over from the binary, or from the database last packed.
-    state = probe_database_state(binary)
+    state = probe_database_state(binary, output_database=database)
     if state["state"] == "crashed":
         for component in state["unpacked_files"]:
             with suppress(OSError):

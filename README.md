@@ -4,10 +4,11 @@ MCP server that gives reverse-engineering agents binary diffing: export binaries
 to [BinExport](https://github.com/google/binexport) v2 and compare two builds
 with [BinDiff](https://github.com/google/bindiff).
 
-IDA is driven through [ida-nexus](https://pypi.org/project/ida-nexus/), so a
-binary already open in the IDA GUI is exported from that database (renames and
-annotations included); otherwise a headless idalib worker is spawned and
-released again when the export finishes. Exports and diffs are read at function
+IDA is driven through [ida-nexus](https://pypi.org/project/ida-nexus/): every
+export runs in a headless idalib worker that is released again when the export
+finishes. Its IDA database (`.i64`) is kept in the output folder next to the
+export, never beside the binary, so the binary's folder can be read-only or open
+in another IDA session. Exports and diffs are read at function
 level only, using the schema of
 [python-binexport](https://pypi.org/project/python-binexport/) and the
 algorithm names of [python-bindiff](https://pypi.org/project/python-bindiff/);
@@ -74,8 +75,9 @@ starts again from the binary or from the last saved `.i64`.
 
 Exports `binary` to `<output_results_dir>/<binary name>.BinExport`. An export
 made from the same bytes (it records their SHA-256) is reused instead of
-re-analyzing the binary; file dates are not trusted.
-The job's `result`:
+re-analyzing the binary; file dates are not trusted. IDA's database is kept
+beside it as `<binary name>.i64` and reopened by the next export; one built from
+another file of the same name is discarded. The job's `result`:
 
 ```json
 {

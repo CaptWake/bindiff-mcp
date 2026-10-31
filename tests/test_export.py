@@ -16,6 +16,7 @@ from contextlib import suppress
 from pathlib import Path
 
 import pytest
+from ida_nexus import DatabaseOpenOptions
 from ida_nexus.errors import RemoteError
 
 from bindiff_mcp.errors import ExportError, TimeLimitError
@@ -28,6 +29,7 @@ from bindiff_mcp.export import (
     export_binary,
 )
 from bindiff_mcp.limits import Deadline
+from bindiff_mcp.reader import exported_binary_sha256
 from tests.fixtures import NORMAL, write_binexport
 
 _ELF = b"\x7fELF"
@@ -224,7 +226,7 @@ def test_an_export_of_other_bytes_is_replaced_whatever_its_date(
     os.utime(export, (binary.stat().st_atime + 10, binary.stat().st_mtime + 10))
     exported: list[tuple[Path, Path]] = []
 
-    def fake_run_export(source: Path, target: Path, **_: object) -> None:
+    def fake_run_export(source: Path, target: Path, *_: object, **__: object) -> None:
         # The stale file must be gone before IDA writes the new one.
         assert not target.exists()
         exported.append((source, target))
@@ -260,7 +262,7 @@ def test_concurrent_exports_of_one_binary_run_ida_once(
     finish = threading.Event()
     exports: list[Path] = []
 
-    def slow_run_export(source: Path, target: Path, **_: object) -> None:
+    def slow_run_export(source: Path, target: Path, *_: object, **__: object) -> None:
         exports.append(target)
         exporting.set()
         assert finish.wait(5)
@@ -302,7 +304,9 @@ class _EndlessAnalysis:
         self.closed: list[str] = []
         self.executed = False
 
-    def open_database(self, path: str, *, set_current: bool) -> dict:
+    def open_database(
+        self, path: str, *, set_current: bool, options: DatabaseOpenOptions
+    ) -> dict:
         return {"instance_id": "worker"}
 
     def wait_autoanalysis(self, instance_id: str, timeout: float) -> dict:
@@ -333,6 +337,58 @@ def test_autoanalysis_stops_at_the_job_limit_and_releases_ida(
     assert list((tmp_path / "out").iterdir()) == []
 
 
+class _ReopeningNexus:
+    """Stands in for the Nexus manager: IDA reopens whatever database it finds."""
+
+    def __init__(self, found_digest: str, binary_digest: str) -> None:
+        self.found_digest = found_digest
+        self.binary_digest = binary_digest
+        self.opened: list[Path] = []
+
+    def open_database(
+        self, path: str, *, set_current: bool, options: DatabaseOpenOptions
+    ) -> dict:
+        self.database = Path(str(options.output_database))
+        self.opened.append(self.database)
+        reopened = self.database.exists()
+        self.analyzed = self.found_digest if reopened else self.binary_digest
+        return {"instance_id": "worker"}
+
+    def wait_autoanalysis(self, instance_id: str, timeout: float) -> dict:
+        return {"status": "complete", "complete": True}
+
+    def execute_python(self, code: str, *_: object, **__: object) -> dict:
+        # What the export snippet does inside IDA: write the BinExport.
+        output = Path(json.loads(code.split("_output = ", 1)[1].split("\n", 1)[0]))
+        _export_of(output, self.analyzed)
+        self.database.write_text(f"database of {self.analyzed}")
+        result = {"idc_result": 0, "plugins_loaded": [], "exists": True, "size": 1}
+        return _execution(result)
+
+    def close_database(self, instance_id: str) -> None:
+        pass
+
+
+def test_a_database_left_by_another_build_is_discarded(
+    tmp_path: Path, monkeypatch
+) -> None:
+    binary = tmp_path / "sample.bin"
+    binary.write_bytes(_ELF)
+    output_dir = tmp_path / "out"
+    output_dir.mkdir()
+    database = output_dir / "sample.bin.i64"
+    other_build = hashlib.sha256(b"another build").hexdigest()
+    database.write_text(f"database of {other_build}")
+    nexus = _ReopeningNexus(found_digest=other_build, binary_digest=_ELF_SHA256)
+    monkeypatch.setattr("bindiff_mcp.export.DATABASE_MANAGER", nexus)
+
+    result = export_binary(binary, output_dir)
+
+    assert exported_binary_sha256(result.binexport) == _ELF_SHA256
+    assert nexus.opened == [database, database]
+    assert database.read_text() == f"database of {_ELF_SHA256}"
+
+
 _SLEEPS = "import time\nprint(flush=True)\ntime.sleep(60)\n"
 _SPAWNS_GRANDCHILD = (
     "import subprocess, sys\n"
@@ -348,28 +404,28 @@ def test_a_worker_left_running_is_killed_and_its_leftovers_dropped(
 ) -> None:
     monkeypatch.setattr("bindiff_mcp.export._WORKER_EXIT_SECONDS", 0.5)
     binary = tmp_path / "sample.bin"
-    binary.write_bytes(b"\x7fELF")
-    (tmp_path / "sample.bin.i64").write_bytes(b"the database last packed")
+    binary.write_bytes(_ELF)
+    output_dir = tmp_path / "out"
+    output_dir.mkdir()
+    database = output_dir / "sample.bin.i64"
+    database.write_bytes(b"the database last packed")
     # What a killed worker leaves: an unlocked .id0 whose B-tree is still open.
-    (tmp_path / "sample.bin.id0").write_bytes(
+    (output_dir / "sample.bin.id0").write_bytes(
         bytes(18) + b"\x01" + b"B-tree v2" + bytes(64)
     )
-    (tmp_path / "sample.bin.nam").write_bytes(b"names")
+    (output_dir / "sample.bin.nam").write_bytes(b"names")
     stuck = subprocess.Popen([sys.executable, "-c", _SLEEPS], stdout=subprocess.PIPE)
     try:
         assert stuck.stdout is not None
         stuck.stdout.readline()
 
-        _stop_worker(stuck.pid, binary)
+        _stop_worker(stuck.pid, binary, database)
 
         assert stuck.wait(5) == -signal.SIGKILL
     finally:
         stuck.kill()
         stuck.wait(5)
-    assert sorted(path.name for path in tmp_path.iterdir()) == [
-        "sample.bin",
-        "sample.bin.i64",
-    ]
+    assert [path.name for path in output_dir.iterdir()] == ["sample.bin.i64"]
 
 
 @pytest.mark.skipif(not Path("/proc/self/stat").exists(), reason="reads /proc")
@@ -383,7 +439,7 @@ def test_a_process_this_server_did_not_spawn_is_never_stopped(
     assert parent.stdout is not None
     foreign = int(parent.stdout.readline())
     try:
-        _stop_worker(foreign, tmp_path / "sample.bin")
+        _stop_worker(foreign, tmp_path / "sample.bin", tmp_path / "sample.bin.i64")
 
         os.kill(foreign, 0)  # still running
     finally:

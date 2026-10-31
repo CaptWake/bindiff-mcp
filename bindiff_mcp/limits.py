@@ -36,7 +36,7 @@ def _count_from_environment(name: str, default: int) -> int:
     return count
 
 
-#: Attaching to a GUI instance is immediate; spawning an idalib worker is not.
+#: Spawning an idalib worker and loading the binary or its database.
 OPEN_TIMEOUT_SECONDS = _seconds_from_environment("BINDIFF_MCP_OPEN_TIMEOUT", 600.0)
 
 #: Initial autoanalysis of one binary; large images take IDA tens of minutes.
